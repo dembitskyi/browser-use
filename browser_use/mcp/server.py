@@ -26,8 +26,6 @@ Or as an MCP server in Claude Desktop or other MCP clients:
 import os
 import sys
 
-# Set environment variables BEFORE any browser_use imports to prevent early logging
-os.environ['BROWSER_USE_LOGGING_LEVEL'] = 'critical'
 os.environ['BROWSER_USE_SETUP_LOGGING'] = 'false'
 
 import asyncio
@@ -36,8 +34,6 @@ import logging
 import time
 from pathlib import Path
 from typing import Any
-
-from browser_use.llm import ChatAWSBedrock
 
 # Configure logging for MCP mode - redirect to stderr but preserve critical diagnostics
 logging.basicConfig(
@@ -54,80 +50,50 @@ except ImportError:
 # Add browser-use to path if running from source
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-# Import and configure logging to use stderr before other imports
-from browser_use.logging_config import setup_logging
-
-
-def _configure_mcp_server_logging():
-	"""Configure logging for MCP server mode - redirect all logs to stderr to prevent JSON RPC interference."""
-	# Set environment to suppress browser-use logging during server mode
-	os.environ['BROWSER_USE_LOGGING_LEVEL'] = 'warning'
-	os.environ['BROWSER_USE_SETUP_LOGGING'] = 'false'  # Prevent automatic logging setup
-
-	# Configure logging to stderr for MCP mode - preserve warnings and above for troubleshooting
-	setup_logging(stream=sys.stderr, log_level='warning', force_setup=True)
-
-	# Also configure the root logger and all existing loggers to use stderr
-	logging.root.handlers = []
-	stderr_handler = logging.StreamHandler(sys.stderr)
-	stderr_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
-	logging.root.addHandler(stderr_handler)
-	logging.root.setLevel(logging.CRITICAL)
-
-	# Configure all existing loggers to use stderr and CRITICAL level
-	for name in list(logging.root.manager.loggerDict.keys()):
-		logger_obj = logging.getLogger(name)
-		logger_obj.handlers = []
-		logger_obj.setLevel(logging.CRITICAL)
-		logger_obj.addHandler(stderr_handler)
-		logger_obj.propagate = False
-
-
-# Configure MCP server logging before any browser_use imports to capture early log lines
-_configure_mcp_server_logging()
-
 # Additional suppression - disable all logging completely for MCP mode
 logging.disable(logging.CRITICAL)
 
-# Import browser_use modules
 from browser_use import ActionModel, Agent
 from browser_use.browser import BrowserProfile, BrowserSession
 from browser_use.config import get_default_llm, get_default_profile, load_browser_use_config
 from browser_use.filesystem.file_system import FileSystem
-from browser_use.llm.openai.chat import ChatOpenAI
-from browser_use.tools.service import Tools
 
-logger = logging.getLogger(__name__)
+# Import browser_use modules
+from browser_use.llm import ChatAWSBedrock
+from browser_use.llm.ollama.chat import ChatOllama
+from browser_use.llm.openai.chat import ChatOpenAI
+from browser_use.llm.opencode.chat import ChatOpencode
+from browser_use.telemetry import MCPServerTelemetryEvent, ProductTelemetry
+from browser_use.tools.service import Tools
+from browser_use.utils import create_task_with_error_handling, get_browser_use_version
 
 
 def _ensure_all_loggers_use_stderr():
-	"""Ensure ALL loggers only output to stderr, not stdout."""
-	# Get the stderr handler
-	stderr_handler = None
-	for handler in logging.root.handlers:
-		if hasattr(handler, 'stream') and handler.stream == sys.stderr:  # type: ignore
-			stderr_handler = handler
-			break
+    """Ensure ALL loggers only output to stderr, not stdout."""
+    logging.disable(logging.NOTSET)
 
-	if not stderr_handler:
-		stderr_handler = logging.StreamHandler(sys.stderr)
-		stderr_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+    log_handler = None
+    log_file = os.environ.get('BROWSER_USE_DEBUG_LOG_FILE')
+    log_level = getattr(logging, os.environ.get('BROWSER_USE_LOGGING_LEVEL', 'critical').upper())
 
-	# Configure root logger
-	logging.root.handlers = [stderr_handler]
-	logging.root.setLevel(logging.CRITICAL)
+    if log_file:
+        log_handler = logging.FileHandler(log_file)
+    else:
+        log_handler = logging.StreamHandler(sys.stderr)
 
-	# Configure all existing loggers
-	for name in list(logging.root.manager.loggerDict.keys()):
-		logger_obj = logging.getLogger(name)
-		logger_obj.handlers = [stderr_handler]
-		logger_obj.setLevel(logging.CRITICAL)
-		logger_obj.propagate = False
+    log_handler.setLevel(log_level)
+    log_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
 
-
-# Ensure stderr logging after all imports
-_ensure_all_loggers_use_stderr()
-
+    # Configure root logger
+    logging.root.handlers = [log_handler]
+    logging.root.setLevel(logging.DEBUG)
+    
+    # Configure all existing loggers
+    for name in list(logging.root.manager.loggerDict.keys()):
+        logger_obj = logging.getLogger(name)
+        logger_obj.handlers = [log_handler]
+        logger_obj.setLevel(logging.DEBUG)
+        logger_obj.propagate = False
 
 # Try to import MCP SDK
 try:
@@ -135,22 +101,19 @@ try:
 	import mcp.types as types
 	from mcp.server import NotificationOptions, Server
 	from mcp.server.models import InitializationOptions
-
 	MCP_AVAILABLE = True
 
 	# Configure MCP SDK logging to stderr as well
 	mcp_logger = logging.getLogger('mcp')
-	mcp_logger.handlers = []
-	mcp_logger.addHandler(logging.root.handlers[0] if logging.root.handlers else logging.StreamHandler(sys.stderr))
-	mcp_logger.setLevel(logging.ERROR)
+	mcp_logger.setLevel(logging.CRITICAL)
 	mcp_logger.propagate = False
 except ImportError:
 	MCP_AVAILABLE = False
-	logger.error('MCP SDK not installed. Install with: pip install mcp')
 	sys.exit(1)
 
-from browser_use.telemetry import MCPServerTelemetryEvent, ProductTelemetry
-from browser_use.utils import create_task_with_error_handling, get_browser_use_version
+# Ensure stderr logging after all imports
+logger = logging.getLogger(__name__)
+_ensure_all_loggers_use_stderr()
 
 
 def get_parent_process_cmdline() -> str | None:
@@ -196,7 +159,7 @@ class BrowserUseServer:
 		self.agent: Agent | None = None
 		self.browser_session: BrowserSession | None = None
 		self.tools: Tools | None = None
-		self.llm: ChatOpenAI | None = None
+		self.llm: ChatOpenAI | ChatOllama | ChatOpencode | None = None
 		self.file_system: FileSystem | None = None
 		self._telemetry = ProductTelemetry()
 		self._start_time = time.time()
@@ -610,10 +573,26 @@ class BrowserUseServer:
 		# Initialize LLM from config
 		llm_config = get_default_llm(self.config)
 		base_url = llm_config.get('base_url', None)
+
+		model_provider = os.getenv('MODEL_PROVIDER', '')
+		host = os.getenv('MODEL_HOST', '')
+
 		kwargs = {}
 		if base_url:
 			kwargs['base_url'] = base_url
-		if api_key := llm_config.get('api_key'):
+
+		if host and model_provider == 'ollama':
+			self.llm = ChatOllama(
+				model=llm_config.get('model'),
+				host=host,
+			)
+		elif model_provider == 'opencode':
+			self.llm = ChatOpencode(
+				model=os.getenv('OPENCODE_MODEL', 'gemini-3.1-pro-preview'),
+				provider_id=os.getenv('OPENCODE_PROVIDER', 'github-copilot'),
+				base_url=os.getenv('OPENCODE_BASE_URL'),
+			)
+		elif api_key := llm_config.get('api_key'):
 			self.llm = ChatOpenAI(
 				model=llm_config.get('model', 'gpt-o4-mini'),
 				api_key=api_key,
@@ -655,6 +634,18 @@ class BrowserUseServer:
 				model=llm_model,  # or any Bedrock model
 				aws_region=aws_region,
 				aws_sso_auth=aws_sso_auth,
+			)
+		elif model_provider and model_provider.lower() == 'ollama':
+			host = os.getenv('MODEL_HOST', '')
+			llm = ChatOllama(
+				model=llm_config.get('model'),
+				host=host,
+			)
+		elif model_provider and model_provider.lower() == 'opencode':
+			llm = ChatOpencode(
+				model=os.getenv('OPENCODE_MODEL', 'gemini-3.1-pro-preview'),
+				provider_id=os.getenv('OPENCODE_PROVIDER', 'github-copilot'),
+				base_url=os.getenv('OPENCODE_BASE_URL'),
 			)
 		else:
 			api_key = llm_config.get('api_key') or os.getenv('OPENAI_API_KEY')

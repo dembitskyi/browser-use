@@ -27,14 +27,7 @@ from pathlib import Path
 
 # Handle --mcp flag early to prevent logging initialization
 if '--mcp' in sys.argv:
-	import logging
-
-	os.environ['BROWSER_USE_LOGGING_LEVEL'] = 'critical'
-	os.environ['BROWSER_USE_SETUP_LOGGING'] = 'false'
-	logging.disable(logging.CRITICAL)
-
 	import asyncio
-
 	from browser_use.mcp.server import main as mcp_main
 
 	asyncio.run(mcp_main())
