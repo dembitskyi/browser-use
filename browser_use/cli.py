@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import sys
-import time
 from contextlib import redirect_stderr, redirect_stdout
 from importlib.metadata import PackageNotFoundError, version
 from io import StringIO
@@ -31,42 +30,13 @@ def _set_harness_client_env() -> None:
 	os.environ['BH_CLIENT_VERSION'] = _browser_use_version()
 
 
-def _capture_via_harness(
-	*,
-	command: str,
-	start_time: float,
-	result: int | str | None = None,
-	error_message: str | None = None,
-) -> None:
-	try:
-		from browser_harness import telemetry as harness_telemetry
-
-		capture_cli_event = getattr(harness_telemetry, 'capture_cli_event', None)
-		if capture_cli_event is None:
-			return
-		_set_harness_client_env()
-		code = _exit_code(result)
-		capture_cli_event(
-			action='error' if code else 'completed',
-			command=command,
-			duration_seconds=time.monotonic() - start_time,
-			exit_code=code,
-			error_message=error_message,
-		)
-	except Exception:
-		pass
-
-
 def _run_mcp_stdio_server(module_name: str) -> None:
-	"""Silence all logging"""
+	"""Run an MCP stdio server (logging is configured by the server itself)."""
 	import asyncio
 	import importlib
-	import logging
 	import os
 
-	os.environ['BROWSER_USE_LOGGING_LEVEL'] = 'critical'
 	os.environ['BROWSER_USE_SETUP_LOGGING'] = 'false'
-	logging.disable(logging.CRITICAL)
 
 	main = importlib.import_module(module_name).main
 	asyncio.run(main())
@@ -400,61 +370,12 @@ def _dispatch(args: list[str]) -> tuple[int | None, str]:
 		return 2, args[0] if args else 'run'
 
 
-class _StderrTail:
-	"""Pass-through stderr wrapper that remembers the tail as error context."""
-
-	def __init__(self, wrapped):
-		self._wrapped = wrapped
-		self.tail = ''
-
-	def write(self, text):
-		self.tail = (self.tail + text)[-500:]
-		return self._wrapped.write(text)
-
-	def __getattr__(self, name):
-		return getattr(self._wrapped, name)
-
-
-def browser_use_tui_main() -> int | None:
-	print('browser-use-tui is deprecated; use browser-use instead.', file=sys.stderr)
-	return main()
-
-
 def main() -> int | None:
 	global _delegated_to_harness
 
 	_delegated_to_harness = False
 	args = sys.argv[1:]
-	start_time = time.monotonic()
-	command = _command_name(args)
-	stderr_tail = _StderrTail(sys.stderr)
-	sys.stderr = stderr_tail
-	try:
-		result, command = _dispatch(args)
-	except SystemExit as exc:
-		result = exc.code
-		if not _delegated_to_harness:
-			_capture_via_harness(
-				command=command,
-				start_time=start_time,
-				result=result,
-				error_message=str(result) if isinstance(result, str) else stderr_tail.tail.strip() or None,
-			)
-		raise
-	except Exception as exc:
-		if not _delegated_to_harness:
-			_capture_via_harness(command=command, start_time=start_time, result=1, error_message=str(exc))
-		raise
-	finally:
-		sys.stderr = stderr_tail._wrapped
-
-	if not _delegated_to_harness:
-		_capture_via_harness(
-			command=command,
-			start_time=start_time,
-			result=result,
-			error_message=(stderr_tail.tail.strip() or None) if _exit_code(result) else None,
-		)
+	result, command = _dispatch(args)
 	return result
 
 

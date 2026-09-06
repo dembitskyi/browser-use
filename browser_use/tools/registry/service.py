@@ -16,7 +16,6 @@ from browser_use.browser.views import BrowserError
 from browser_use.filesystem.file_system import FileSystem
 from browser_use.llm.base import BaseChatModel
 from browser_use.observability import observe_debug
-from browser_use.telemetry.service import ProductTelemetry
 from browser_use.tools.registry.views import (
 	ActionModel,
 	ActionRegistry,
@@ -35,7 +34,6 @@ class Registry(Generic[Context]):
 
 	def __init__(self, exclude_actions: list[str] | None = None):
 		self.registry = ActionRegistry()
-		self.telemetry = ProductTelemetry()
 		# Create a new list to avoid mutable default argument issues
 		self.exclude_actions = list(exclude_actions) if exclude_actions is not None else []
 

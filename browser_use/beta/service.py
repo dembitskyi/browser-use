@@ -62,8 +62,6 @@ from browser_use.llm.messages import BaseMessage, ContentPartImageParam, Content
 from browser_use.llm.views import ChatInvokeUsage
 from browser_use.observability import observe
 from browser_use.screenshots.service import ScreenshotService
-from browser_use.telemetry.service import ProductTelemetry
-from browser_use.telemetry.views import AgentTelemetryEvent
 from browser_use.tokens.custom_pricing import CUSTOM_MODEL_PRICING
 from browser_use.tokens.service import TokenCost
 from browser_use.tokens.views import ModelUsageStats, UsageSummary
@@ -73,7 +71,6 @@ from browser_use.utils import (
 	URL_PATTERN,
 	SignalHandler,
 	_log_pretty_path,
-	check_latest_browser_use_version,
 	get_browser_use_version,
 	get_git_info,
 	has_url_negation,
@@ -4435,7 +4432,6 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		if self.settings.message_compaction and self.settings.message_compaction.compaction_llm:
 			_register_llm_for_usage(self.token_cost_service, self.settings.message_compaction.compaction_llm)
 		self.enable_signal_handler = enable_signal_handler
-		self.telemetry = ProductTelemetry()
 		self.eventbus = EventBus(name=_eventbus_name(self.id))
 		self._eventbus_stopped = False
 		self.available_file_paths = available_file_paths or []
@@ -4574,11 +4570,6 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		"""Log Browser Use run metadata for the Rust-backed wrapper."""
 		self.logger.info(f'\033[34m🎯 Task: {self.task}\033[0m')
 		self.logger.debug(f'🤖 Browser-Use Library Version {self.version} ({self.source})')
-		latest_version = await check_latest_browser_use_version()
-		if latest_version and latest_version != self.version:
-			self.logger.info(
-				f'📦 Newer version available: {latest_version} (current: {self.version}). Upgrade with: uv add browser-use=={latest_version}'
-			)
 
 	def _log_agent_setup(self) -> None:
 		"""Log Browser Use run setup metadata for the Rust-backed wrapper."""
@@ -4739,72 +4730,6 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		judge_log += f'   {judgement.reasoning}\n'
 		self.logger.info(judge_log)
 
-	def _log_agent_event(self, max_steps: int, agent_run_error: str | None = None) -> None:
-		"""Emit Browser Use telemetry for a Rust-backed run."""
-		usage = self.history.usage
-		if usage is None:
-			total_input_tokens = 0
-			total_output_tokens = 0
-			prompt_cached_tokens = 0
-			total_tokens = 0
-		else:
-			total_input_tokens = usage.total_prompt_tokens
-			total_output_tokens = usage.total_completion_tokens
-			prompt_cached_tokens = usage.total_prompt_cached_tokens
-			total_tokens = usage.total_tokens
-
-		action_history_data = []
-		for item in self.history.history:
-			if item.model_output and item.model_output.action:
-				action_history_data.append(
-					[action.model_dump(exclude_unset=True) for action in item.model_output.action if action]
-				)
-			else:
-				action_history_data.append(None)
-
-		final_result = self.history.final_result()
-		final_result_str = json.dumps(final_result) if final_result is not None else None
-		cdp_url = getattr(self.browser_session, 'cdp_url', None) if self.browser_session else None
-		model = getattr(self.llm, 'model', None) or self.model
-		provider = getattr(self.llm, 'provider', None) or 'rust-terminal'
-
-		self.telemetry.capture(
-			AgentTelemetryEvent(
-				task=self.task,
-				model=model,
-				model_provider=provider,
-				max_steps=max_steps,
-				max_actions_per_step=self.settings.max_actions_per_step,
-				use_vision=self.settings.use_vision,
-				version=self.version or '',
-				source=self.source,
-				cdp_url=urlparse(cdp_url).hostname if cdp_url else None,
-				agent_type='rust_core',
-				action_errors=self.history.errors(),
-				action_history=action_history_data,
-				urls_visited=[url for url in self.history.urls() if url],
-				steps=self.history.number_of_steps(),
-				total_input_tokens=total_input_tokens,
-				total_output_tokens=total_output_tokens,
-				prompt_cached_tokens=prompt_cached_tokens,
-				total_tokens=total_tokens,
-				total_duration_seconds=self.history.total_duration_seconds(),
-				success=self.history.is_successful(),
-				final_result_response=final_result_str,
-				error_message=agent_run_error,
-			)
-		)
-
-	def _record_run_telemetry(self, max_steps: int, agent_run_error: str | None = None) -> None:
-		"""Record Browser Use run telemetry without allowing telemetry failures to break the run."""
-		if getattr(self, '_force_exit_telemetry_logged', False):
-			self.logger.debug('Telemetry for force exit (SIGINT) was logged by custom exit callback.')
-			return
-		try:
-			self._log_agent_event(max_steps=max_steps, agent_run_error=agent_run_error)
-		except Exception as exc:
-			self.logger.error(f'Failed to log telemetry event: {exc}', exc_info=True)
-
 	def _record_laminar_run_observability(
 		self,
 		*,
@@ -4919,19 +4844,11 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 	def _register_run_signal_handler(self, max_steps: int) -> SignalHandler:
 		"""Register Browser Use SIGINT/SIGTERM handling for a Rust-backed run."""
 		self._unregister_run_signal_handler()
-		self._force_exit_telemetry_logged = False
-
-		def on_force_exit_log_telemetry() -> None:
-			self._record_run_telemetry(max_steps=max_steps, agent_run_error='SIGINT: Cancelled by user')
-			if hasattr(self, 'telemetry') and self.telemetry:
-				self.telemetry.flush()
-			self._force_exit_telemetry_logged = True
 
 		signal_handler = SignalHandler(
 			loop=asyncio.get_event_loop(),
 			pause_callback=self.pause,
 			resume_callback=self.resume,
-			custom_exit_callback=on_force_exit_log_telemetry,
 			exit_on_second_int=True,
 		)
 		signal_handler.register()
@@ -4994,7 +4911,6 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			duration_seconds=None,
 			process_error=agent_run_error,
 		)
-		self._record_run_telemetry(max_steps=max_steps, agent_run_error=agent_run_error)
 		self._dispatch_run_update_event()
 		self._log_final_outcome_messages()
 		await self._finalize_run_cleanup()
@@ -5077,7 +4993,6 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 				duration_seconds=finished - started,
 				process_error='Beta agent stopped before terminal run.',
 			)
-			self._record_run_telemetry(max_steps=max_steps, agent_run_error='Beta agent stopped before terminal run.')
 			self._dispatch_run_update_event()
 			self._log_final_outcome_messages()
 			await self._finalize_run_cleanup()
@@ -5107,7 +5022,6 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 					duration_seconds=finished - started,
 					process_error='Beta agent stopped before terminal run.',
 				)
-				self._record_run_telemetry(max_steps=max_steps, agent_run_error='Beta agent stopped before terminal run.')
 				self._dispatch_run_update_event()
 				self._log_final_outcome_messages()
 				await self._finalize_run_cleanup()
@@ -5339,7 +5253,6 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			duration_seconds=finished - started,
 			process_error=process_error,
 		)
-		self._record_run_telemetry(max_steps=max_steps, agent_run_error=process_error)
 		self._dispatch_run_update_event()
 		await self._check_and_update_downloads(source)
 		await self._save_conversation_if_requested()

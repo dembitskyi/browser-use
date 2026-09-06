@@ -17,12 +17,10 @@ from browser_use.utils import _log_pretty_path, logger
 
 
 def _get_enable_default_extensions_default() -> bool:
-	"""Get the default value for enable_default_extensions from env var or True."""
-	env_val = os.getenv('BROWSER_USE_DISABLE_EXTENSIONS')
-	if env_val is not None:
-		# If DISABLE_EXTENSIONS is truthy, return False (extensions disabled)
-		return env_val.lower() in ('0', 'false', 'no', 'off', '')
-	return True
+	"""Opt-in default for enable_default_extensions via BROWSER_USE_ENABLE_EXTENSIONS."""
+	if os.getenv('BROWSER_USE_DISABLE_EXTENSIONS') is not None:
+		return False
+	return os.getenv('BROWSER_USE_ENABLE_EXTENSIONS', '').lower() in ('1', 'true', 'yes', 'on')
 
 
 def _get_headless_default() -> bool | None:

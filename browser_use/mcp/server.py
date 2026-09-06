@@ -26,8 +26,6 @@ Or as an MCP server in Claude Desktop or other MCP clients:
 import os
 import sys
 
-# Set environment variables BEFORE any browser_use imports to prevent early logging
-os.environ['BROWSER_USE_LOGGING_LEVEL'] = 'critical'
 os.environ['BROWSER_USE_SETUP_LOGGING'] = 'false'
 
 import asyncio
@@ -37,96 +35,66 @@ import time
 from pathlib import Path
 from typing import Any
 
-from browser_use.llm import ChatAWSBedrock
-
 # Configure logging for MCP mode - redirect to stderr but preserve critical diagnostics
 logging.basicConfig(
 	stream=sys.stderr, level=logging.WARNING, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', force=True
 )
 
-try:
-	import psutil
-
-	PSUTIL_AVAILABLE = True
-except ImportError:
-	PSUTIL_AVAILABLE = False
-
 # Add browser-use to path if running from source
 sys.path.insert(0, str(Path(__file__).parent.parent))
-
-# Import and configure logging to use stderr before other imports
-from browser_use.logging_config import setup_logging
-
-
-def _configure_mcp_server_logging():
-	"""Configure logging for MCP server mode - redirect all logs to stderr to prevent JSON RPC interference."""
-	# Set environment to suppress browser-use logging during server mode
-	os.environ['BROWSER_USE_LOGGING_LEVEL'] = 'warning'
-	os.environ['BROWSER_USE_SETUP_LOGGING'] = 'false'  # Prevent automatic logging setup
-
-	# Configure logging to stderr for MCP mode - preserve warnings and above for troubleshooting
-	setup_logging(stream=sys.stderr, log_level='warning', force_setup=True)
-
-	# Also configure the root logger and all existing loggers to use stderr
-	logging.root.handlers = []
-	stderr_handler = logging.StreamHandler(sys.stderr)
-	stderr_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
-	logging.root.addHandler(stderr_handler)
-	logging.root.setLevel(logging.CRITICAL)
-
-	# Configure all existing loggers to use stderr and CRITICAL level
-	for name in list(logging.root.manager.loggerDict.keys()):
-		logger_obj = logging.getLogger(name)
-		logger_obj.handlers = []
-		logger_obj.setLevel(logging.CRITICAL)
-		logger_obj.addHandler(stderr_handler)
-		logger_obj.propagate = False
-
-
-# Configure MCP server logging before any browser_use imports to capture early log lines
-_configure_mcp_server_logging()
 
 # Additional suppression - disable all logging completely for MCP mode
 logging.disable(logging.CRITICAL)
 
-# Import browser_use modules
 from browser_use import ActionModel, Agent
 from browser_use.browser import BrowserProfile, BrowserSession
 from browser_use.config import get_default_llm, get_default_profile, load_browser_use_config
 from browser_use.filesystem.file_system import FileSystem
-from browser_use.llm.openai.chat import ChatOpenAI
-from browser_use.tools.service import Tools
 
-logger = logging.getLogger(__name__)
+# Import browser_use modules
+from browser_use.llm import ChatAWSBedrock
+from browser_use.llm.ollama.chat import ChatOllama
+from browser_use.llm.openai.chat import ChatOpenAI
+from browser_use.llm.opencode.chat import ChatOpencode
+from browser_use.tools.service import Tools
+from browser_use.utils import create_task_with_error_handling, get_browser_use_version
 
 
 def _ensure_all_loggers_use_stderr():
-	"""Ensure ALL loggers only output to stderr, not stdout."""
-	# Get the stderr handler
-	stderr_handler = None
-	for handler in logging.root.handlers:
-		if hasattr(handler, 'stream') and handler.stream == sys.stderr:  # type: ignore
-			stderr_handler = handler
-			break
+	"""Ensure ALL loggers only output to stderr (or the debug log file), not stdout."""
+	logging.disable(logging.NOTSET)
 
-	if not stderr_handler:
-		stderr_handler = logging.StreamHandler(sys.stderr)
-		stderr_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+	log_handler = None
+	log_file = os.environ.get('BROWSER_USE_DEBUG_LOG_FILE')
+	log_level = getattr(logging, os.environ.get('BROWSER_USE_LOGGING_LEVEL', 'critical').upper(), logging.WARNING)
+
+	if log_file:
+		log_handler = logging.FileHandler(log_file)
+	else:
+		log_handler = logging.StreamHandler(sys.stderr)
+
+	log_handler.setLevel(log_level)
+	log_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
 
 	# Configure root logger
-	logging.root.handlers = [stderr_handler]
-	logging.root.setLevel(logging.CRITICAL)
+	logging.root.handlers = [log_handler]
+	logging.root.setLevel(logging.DEBUG)
 
 	# Configure all existing loggers
 	for name in list(logging.root.manager.loggerDict.keys()):
 		logger_obj = logging.getLogger(name)
-		logger_obj.handlers = [stderr_handler]
-		logger_obj.setLevel(logging.CRITICAL)
+		logger_obj.handlers = [log_handler]
+		logger_obj.setLevel(logging.DEBUG)
 		logger_obj.propagate = False
 
 
-# Ensure stderr logging after all imports
-_ensure_all_loggers_use_stderr()
+def _preview(value: Any, limit: int = 200) -> str:
+	"""Log-safe rendering of tool args/results; truncates large/base64 payloads."""
+	if isinstance(value, list):
+		blocks = [getattr(b, 'type', type(b).__name__) for b in value]
+		return f'<{len(value)} content blocks: {blocks}>'
+	text = value if isinstance(value, str) else json.dumps(value, default=str)
+	return text[:limit] + f'…(+{len(text) - limit})' if len(text) > limit else text
 
 
 # Try to import MCP SDK
@@ -134,53 +102,19 @@ try:
 	import mcp.server.stdio
 	import mcp.types as types
 	from mcp.server import Server
-
 	MCP_AVAILABLE = True
 
 	# Configure MCP SDK logging to stderr as well
 	mcp_logger = logging.getLogger('mcp')
-	mcp_logger.handlers = []
-	mcp_logger.addHandler(logging.root.handlers[0] if logging.root.handlers else logging.StreamHandler(sys.stderr))
-	mcp_logger.setLevel(logging.ERROR)
+	mcp_logger.setLevel(logging.CRITICAL)
 	mcp_logger.propagate = False
 except ImportError:
 	MCP_AVAILABLE = False
-	logger.error('MCP SDK not installed. Install with: pip install mcp')
 	sys.exit(1)
 
-from browser_use.telemetry import MCPServerTelemetryEvent, ProductTelemetry
-from browser_use.utils import create_task_with_error_handling, get_browser_use_version
-
-
-def get_parent_process_cmdline() -> str | None:
-	"""Get the command line of all parent processes up the chain."""
-	if not PSUTIL_AVAILABLE:
-		return None
-
-	try:
-		cmdlines = []
-		current_process = psutil.Process()
-		parent = current_process.parent()
-
-		while parent:
-			try:
-				cmdline = parent.cmdline()
-				if cmdline:
-					cmdlines.append(' '.join(cmdline))
-			except (psutil.AccessDenied, psutil.NoSuchProcess):
-				# Skip processes we can't access (like system processes)
-				pass
-
-			try:
-				parent = parent.parent()
-			except (psutil.AccessDenied, psutil.NoSuchProcess):
-				# Can't go further up the chain
-				break
-
-		return ';'.join(cmdlines) if cmdlines else None
-	except Exception:
-		# If we can't get parent process info, just return None
-		return None
+# Ensure stderr logging after all imports
+logger = logging.getLogger(__name__)
+_ensure_all_loggers_use_stderr()
 
 
 class BrowserUseServer:
@@ -195,9 +129,8 @@ class BrowserUseServer:
 		self.agent: Agent | None = None
 		self.browser_session: BrowserSession | None = None
 		self.tools: Tools | None = None
-		self.llm: ChatOpenAI | None = None
+		self.llm: ChatOpenAI | ChatOllama | ChatOpencode | None = None
 		self.file_system: FileSystem | None = None
-		self._telemetry = ProductTelemetry()
 		self._start_time = time.time()
 
 		# Session management
@@ -466,32 +399,20 @@ class BrowserUseServer:
 		async def handle_call_tool(_context: Any, params: types.CallToolRequestParams) -> types.CallToolResult:
 			"""Handle tool execution."""
 			name = params.name
-			arguments = params.arguments
-			start_time = time.time()
-			error_msg = None
+			arguments = params.arguments or {}
+			start = time.time()
+			logger.info(f'tools/call -> {name} args={_preview(arguments)}')
 			try:
-				result = await self._execute_tool(name, arguments or {})
+				result = await self._execute_tool(name, arguments)
+				logger.info(f'tools/call ok {name} in {time.time() - start:.2f}s -> {_preview(result)}')
 				if isinstance(result, list):
 					return types.CallToolResult(content=result)
 				return types.CallToolResult(content=[types.TextContent(type='text', text=result)])
 			except Exception as e:
-				error_msg = str(e)
-				logger.error(f'Tool execution failed: {e}', exc_info=True)
+				logger.error(f'tools/call failed {name} in {time.time() - start:.2f}s: {e}', exc_info=True)
 				return types.CallToolResult(
 					content=[types.TextContent(type='text', text=f'Error: {str(e)}')],
 					is_error=True,
-				)
-			finally:
-				# Capture telemetry for tool calls
-				duration = time.time() - start_time
-				self._telemetry.capture(
-					MCPServerTelemetryEvent(
-						version=get_browser_use_version(),
-						action='tool_call',
-						tool_name=name,
-						duration_seconds=duration,
-						error_message=error_msg,
-					)
 				)
 
 		self.server.add_request_handler('tools/list', types.PaginatedRequestParams, handle_list_tools)
@@ -590,7 +511,7 @@ class BrowserUseServer:
 		# Ensure all logging goes to stderr before browser initialization
 		_ensure_all_loggers_use_stderr()
 
-		logger.debug('Initializing browser session...')
+		logger.info('Initializing browser session...')
 
 		# Get profile config
 		profile_config = get_default_profile(self.config)
@@ -631,10 +552,26 @@ class BrowserUseServer:
 		# Initialize LLM from config
 		llm_config = get_default_llm(self.config)
 		base_url = llm_config.get('base_url', None)
+
+		model_provider = os.getenv('MODEL_PROVIDER', '')
+		host = os.getenv('MODEL_HOST', '')
+
 		kwargs = {}
 		if base_url:
 			kwargs['base_url'] = base_url
-		if api_key := llm_config.get('api_key'):
+
+		if host and model_provider == 'ollama':
+			self.llm = ChatOllama(
+				model=llm_config.get('model'),
+				host=host,
+			)
+		elif model_provider == 'opencode':
+			self.llm = ChatOpencode(
+				model=os.getenv('OPENCODE_MODEL', 'gemini-3.1-pro-preview'),
+				provider_id=os.getenv('OPENCODE_PROVIDER', 'github-copilot'),
+				base_url=os.getenv('OPENCODE_BASE_URL'),
+			)
+		elif api_key := llm_config.get('api_key'):
 			self.llm = ChatOpenAI(
 				model=llm_config.get('model', 'gpt-o4-mini'),
 				api_key=api_key,
@@ -646,7 +583,7 @@ class BrowserUseServer:
 		file_system_path = profile_config.get('file_system_path', '~/.browser-use-mcp')
 		self.file_system = FileSystem(base_dir=Path(file_system_path).expanduser())
 
-		logger.debug('Browser session initialized')
+		logger.info('Browser session initialized')
 
 	async def _retry_with_browser_use_agent(
 		self,
@@ -657,7 +594,7 @@ class BrowserUseServer:
 		use_vision: bool = True,
 	) -> str:
 		"""Run an autonomous agent task."""
-		logger.debug(f'Running agent task: {task}')
+		logger.info(f'Running agent task: {task}')
 
 		# Get LLM config
 		llm_config = get_default_llm(self.config)
@@ -676,6 +613,18 @@ class BrowserUseServer:
 				model=llm_model,  # or any Bedrock model
 				aws_region=aws_region,
 				aws_sso_auth=aws_sso_auth,
+			)
+		elif model_provider and model_provider.lower() == 'ollama':
+			host = os.getenv('MODEL_HOST', '')
+			llm = ChatOllama(
+				model=llm_config.get('model'),
+				host=host,
+			)
+		elif model_provider and model_provider.lower() == 'opencode':
+			llm = ChatOpencode(
+				model=os.getenv('OPENCODE_MODEL', 'gemini-3.1-pro-preview'),
+				provider_id=os.getenv('OPENCODE_PROVIDER', 'github-copilot'),
+				base_url=os.getenv('OPENCODE_BASE_URL'),
 			)
 		else:
 			api_key = llm_config.get('api_key') or os.getenv('OPENAI_API_KEY')
@@ -1267,27 +1216,7 @@ async def main(session_timeout_minutes: int = 10):
 		sys.exit(1)
 
 	server = BrowserUseServer(session_timeout_minutes=session_timeout_minutes)
-	server._telemetry.capture(
-		MCPServerTelemetryEvent(
-			version=get_browser_use_version(),
-			action='start',
-			parent_process_cmdline=get_parent_process_cmdline(),
-		)
-	)
-
-	try:
-		await server.run()
-	finally:
-		duration = time.time() - server._start_time
-		server._telemetry.capture(
-			MCPServerTelemetryEvent(
-				version=get_browser_use_version(),
-				action='stop',
-				duration_seconds=duration,
-				parent_process_cmdline=get_parent_process_cmdline(),
-			)
-		)
-		server._telemetry.flush()
+	await server.run()
 
 
 if __name__ == '__main__':

@@ -56,11 +56,11 @@ class OldConfig:
 
 	@property
 	def ANONYMIZED_TELEMETRY(self) -> bool:
-		return os.getenv('ANONYMIZED_TELEMETRY', 'true').lower()[:1] in 'ty1'
+		return os.getenv('ANONYMIZED_TELEMETRY', 'false').lower()[:1] in 'ty1'
 
 	@property
 	def BROWSER_USE_CLOUD_SYNC(self) -> bool:
-		return os.getenv('BROWSER_USE_CLOUD_SYNC', str(self.ANONYMIZED_TELEMETRY)).lower()[:1] in 'ty1'
+		return os.getenv('BROWSER_USE_CLOUD_SYNC', 'false').lower()[:1] in 'ty1'
 
 	@property
 	def BROWSER_USE_CLOUD_API_URL(self) -> str:
@@ -181,7 +181,7 @@ class OldConfig:
 
 	@property
 	def BROWSER_USE_VERSION_CHECK(self) -> bool:
-		return os.getenv('BROWSER_USE_VERSION_CHECK', 'true').lower()[:1] in 'ty1'
+		return os.getenv('BROWSER_USE_VERSION_CHECK', 'false').lower()[:1] in 'ty1'
 
 	@property
 	def WIN_FONT_DIR(self) -> str:
